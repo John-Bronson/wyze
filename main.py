@@ -86,6 +86,29 @@ def toggle_device(mac, action):
         return f"Error controlling device: {str(e)}"
 
 
+@app.route("/carriage/")
+def carriage():
+    try:
+        client = get_client()
+        # device = next((d for d in client.devices_list() if d.mac == "7C78B28B1788"), None) # carriage house
+        device = next((d for d in client.devices_list() if d.mac == "2CAA8E5460E2"), None) # floor lamp
+        html = ""
+        html += f"""
+            <p>
+                <a href="/toggle/{device.mac}/on" style="font-size: 74px; padding: 20px 10px; padding-top: 200px; background: #4CAF50; color: white; text-decoration: none; border-radius: 4px; margin-bottom: 10px;">
+                    Turn On
+                </a>
+                <br />
+                <a href="/toggle/{device.mac}/off" style="font-size: 74px; padding: 5px 10px; background: #f44336; color: white; text-decoration: none; border-radius: 4px;">
+                    Turn Off
+                </a>
+            </p>
+        """
+        return html
+
+    except WyzeApiError as e:
+        return f"Error controlling device: {str(e)}"
+
 @app.route("/")
 def hello_world():
     wyze_info = get_wyze_info()
@@ -122,3 +145,6 @@ def hello_world():
         html += "</div>"
 
     return html
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=5000, debug=True)
