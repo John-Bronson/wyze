@@ -1,79 +1,34 @@
 from flask import Flask, redirect, url_for
 import os
-from wyze_sdk import Client
 from wyze_sdk.errors import WyzeApiError
 from dotenv import load_dotenv
+
+# Import the single instance of our token manager from the refactored file
+from token_manager import token_manager
 
 app = Flask(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Validate required environment variables
+# Validate required environment variables at startup
 def validate_env_vars():
     required_vars = ['WYZE_EMAIL', 'WYZE_PASSWORD', 'WYZE_KEY_ID', 'WYZE_API_KEY']
     missing_vars = [var for var in required_vars if not os.getenv(var)]
-
     if missing_vars:
         raise EnvironmentError(
             f"Missing required environment variables: {', '.join(missing_vars)}\n"
             "Please check your .env file and ensure all required variables are set."
         )
 
-def get_wyze_info():
-    try:
-        # Login to Wyze
-        response = Client().login(
-            email=os.getenv('WYZE_EMAIL'),
-            password=os.getenv('WYZE_PASSWORD'),
-            key_id=os.getenv('WYZE_KEY_ID'),
-            api_key=os.getenv('WYZE_API_KEY')
-        )
-
-        client = Client(token=response['access_token'])
-
-        # Get device information
-        devices_info = []
-        for device in client.devices_list():
-            device_info = {
-                'mac': device.mac,
-                'nickname': device.nickname,
-                'is_online': device.is_online,
-                'product_model': device.product.model
-            }
-            devices_info.append(device_info)
-
-        return {
-            'access_token': response['access_token'],
-            'refresh_token': response['refresh_token'],
-            'devices': devices_info
-        }
-    except WyzeApiError as e:
-        return {'error': str(e)}
-
-def get_client():
-    """Helper function to get an authenticated Wyze client"""
-    response = Client().login(
-        email=os.getenv('WYZE_EMAIL'),
-        password=os.getenv('WYZE_PASSWORD'),
-        key_id=os.getenv('WYZE_KEY_ID'),
-        api_key=os.getenv('WYZE_API_KEY')
-    )
-    return Client(token=response['access_token'])
+# We no longer need get_wyze_info() or the old get_client()
 
 @app.route("/toggle/<mac>/<action>")
 def toggle_device(mac, action):
     try:
-        client = get_client()
+        # Get the single, managed client instance
+        client = token_manager.get_client()
         device = next((d for d in client.devices_list() if d.mac == mac), None)
-    #
-    #     client.plugs.turn_off(device_mac=device.mac, device_model=device.product.model)
-    #
-    #     return f"<p>Turning {device.nickname} {action}</p>"
-    #
-    #
-    # except WyzeApiError as e:
-    #     return f"Error controlling device: {str(e)}"
 
         if device:
             if action == "on":
@@ -85,15 +40,16 @@ def toggle_device(mac, action):
     except WyzeApiError as e:
         return f"Error controlling device: {str(e)}"
 
-
 @app.route("/carriage/")
 def carriage():
     try:
-        client = get_client()
-        # device = next((d for d in client.devices_list() if d.mac == "7C78B28B1788"), None) # carriage house
+        # Get the single, managed client instance
+        client = token_manager.get_client()
         device = next((d for d in client.devices_list() if d.mac == "2CAA8E5460E2"), None) # floor lamp
-        html = ""
-        html += f"""
+        if not device:
+            return "<p>Carriage device not found.</p>"
+
+        html = f"""
             <p>
                 <a href="/toggle/{device.mac}/on" style="font-size: 74px; padding: 20px 10px; padding-top: 200px; background: #4CAF50; color: white; text-decoration: none; border-radius: 4px; margin-bottom: 10px;">
                     Turn On
@@ -105,45 +61,44 @@ def carriage():
             </p>
         """
         return html
-
     except WyzeApiError as e:
         return f"Error controlling device: {str(e)}"
 
 @app.route("/")
 def hello_world():
-    wyze_info = get_wyze_info()
+    try:
+        # Validate environment variables on first load
+        validate_env_vars()
+        # Get the single, managed client instance
+        client = token_manager.get_client()
+        devices = client.devices_list()
+    except (WyzeApiError, EnvironmentError) as e:
+        return f"<p>Error: {e}</p>"
 
     # Create HTML output
-    if 'error' in wyze_info:
-        return f"<p>Error: {wyze_info['error']}</p>"
-
     html = "<h1>Wyze Device Information</h1>"
-
     html += "<h2>Devices:</h2>"
-    for device in wyze_info['devices']:
+    for device in devices:
         html += "<div style='margin-bottom: 20px; padding: 10px; border: 1px solid #ccc;'>"
-        html += f"<p><strong>Nickname:</strong> {device['nickname']}</p>"
-        html += f"<p><strong>MAC:</strong> {device['mac']}</p>"
-        html += f"<p><strong>Status:</strong> {'Online' if device['is_online'] else 'Offline'}</p>"
-        html += f"<p><strong>Model:</strong> {device['product_model']}</p>"
+        html += f"<p><strong>Nickname:</strong> {device.nickname}</p>"
+        html += f"<p><strong>MAC:</strong> {device.mac}</p>"
+        html += f"<p><strong>Status:</strong> {'Online' if device.is_online else 'Offline'}</p>"
+        html += f"<p><strong>Model:</strong> {device.product.model}</p>"
 
-        # Add control buttons
-        if device['is_online']:
+        if device.is_online:
             html += f"""
                 <p>
-                    <a href="/toggle/{device['mac']}/on" style="padding: 5px 10px; background: #4CAF50; color: white; text-decoration: none; border-radius: 4px; margin-right: 10px;">
+                    <a href="/toggle/{device.mac}/on" style="padding: 5px 10px; background: #4CAF50; color: white; text-decoration: none; border-radius: 4px; margin-right: 10px;">
                         Turn On
                     </a>
-                    <a href="/toggle/{device['mac']}/off" style="padding: 5px 10px; background: #f44336; color: white; text-decoration: none; border-radius: 4px;">
+                    <a href="/toggle/{device.mac}/off" style="padding: 5px 10px; background: #f44336; color: white; text-decoration: none; border-radius: 4px;">
                         Turn Off
                     </a>
                 </p>
             """
         else:
             html += "<p><em>Device is offline - cannot control</em></p>"
-
         html += "</div>"
-
     return html
 
 if __name__ == "__main__":
