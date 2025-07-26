@@ -36,7 +36,7 @@ def toggle_device(mac, action):
             elif action == "off":
                 client.plugs.turn_off(device_mac=device.mac, device_model=device.product.model)
 
-        return redirect(url_for('hello_world'))
+        return redirect(url_for('index'))
     except WyzeApiError as e:
         return f"Error controlling device: {str(e)}"
 
@@ -65,7 +65,7 @@ def carriage():
         return f"Error controlling device: {str(e)}"
 
 @app.route("/")
-def hello_world():
+def index():
     try:
         # Validate environment variables on first load
         validate_env_vars()
