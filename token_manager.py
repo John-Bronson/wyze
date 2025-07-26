@@ -66,10 +66,14 @@ class TokenManager:
     def get_client(self) -> Client:
         """The main method to get a valid and authenticated client."""
         if self.is_token_expired():
+            print(f"Access token is expired. Refreshing...")
             if self.refresh_token:
+                print(f"Refresh token found. Authenticating with refresh token...")
                 self._refresh()
             else:
+                print(f"No refresh token found. Performing full login...")
                 self._login()
+        print(f"Access token is valid. Returning client instance.")
         return self.client
 
 # Single, global instance for the app to use
