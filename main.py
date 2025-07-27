@@ -28,13 +28,20 @@ def toggle_device(mac, action):
     try:
         # Get the single, managed client instance
         client = token_manager.get_client()
-        device = next((d for d in client.devices_list() if d.mac == mac), None)
+        device = next((device for device in client.devices_list() if device.mac == mac), None)
+
+        device_controllers = {
+            'MeshLight': client.bulbs,
+            'Plug': client.plugs
+        }
+
+        controller = device_controllers.get(device.type)
 
         if device:
             if action == "on":
-                client.plugs.turn_on(device_mac=device.mac, device_model=device.product.model)
+                controller.turn_on(device_mac=device.mac, device_model=device.product.model)
             elif action == "off":
-                client.plugs.turn_off(device_mac=device.mac, device_model=device.product.model)
+                controller.turn_off(device_mac=device.mac, device_model=device.product.model)
 
         return redirect(url_for('index'))
     except WyzeApiError as e:
