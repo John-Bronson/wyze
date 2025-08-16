@@ -30,6 +30,8 @@ def toggle_device(mac, action):
         client = token_manager.get_client()
         device = next((device for device in client.devices_list() if device.mac == mac), None)
 
+        print(f"Toggling device: {device.nickname} ({device.mac}) with action: {action}")
+
         device_controllers = {
             'MeshLight': client.bulbs,
             'Plug': client.plugs
