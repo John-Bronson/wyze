@@ -34,8 +34,8 @@ def toggle_device(mac, action):
         print(device)
 
         device_controllers = {
-            'MeshLight': client.bulbs,
             'Plug': client.plugs,
+            'MeshLight': client.bulbs,
             'Bulb': client.bulbs,
             'Light': client.bulbs
         }
