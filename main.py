@@ -30,11 +30,14 @@ def toggle_device(mac, action):
         client = token_manager.get_client()
         device = next((device for device in client.devices_list() if device.mac == mac), None)
 
-        print(f"Toggling device: {device.nickname} ({device.mac}) with action: {action}")
+        print(f"Toggling device: {device.nickname} ({device.mac}) of type {device.type} with action: {action}")
+        print(device)
 
         device_controllers = {
             'MeshLight': client.bulbs,
-            'Plug': client.plugs
+            'Plug': client.plugs,
+            'Bulb': client.bulbs,
+            'Light': client.bulbs
         }
 
         controller = device_controllers.get(device.type)
