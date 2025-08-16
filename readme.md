@@ -1,6 +1,7 @@
 ```
-python3 -m venv .venv
 . .venv/bin/activate
-pip install Flask wyze_sdk dotenv
+pip install Flask
+pip install wyze_sdk
+pip install dotenv
 
 ```
