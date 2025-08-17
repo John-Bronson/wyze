@@ -93,6 +93,7 @@ def index():
     for device in devices:
         html += "<div style='margin-bottom: 20px; padding: 10px; border: 1px solid #ccc;'>"
         html += f"<p><strong>Nickname:</strong> {device.nickname}</p>"
+        html += f"<p><strong>Type:</strong> {device.type}</p>"
         html += f"<p><strong>MAC:</strong> {device.mac}</p>"
         html += f"<p><strong>Status:</strong> {'Online' if device.is_online else 'Offline'}</p>"
         html += f"<p><strong>Model:</strong> {device.product.model}</p>"
