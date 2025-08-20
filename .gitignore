@@ -3,3 +3,5 @@
 .venv/
 __pycache__/
 
+# Allow run configurations to be shared on git
+!.idea/runConfigurations/
