@@ -1,12 +1,6 @@
 # Wyze Camera Flask App Setup on Raspberry Pi
 
-This guide will help you set up a Flask web application for controlling Wyze cameras on a Raspberry Pi, using nginx as a reverse proxy and systemd for service management.
-
-## Prerequisites
-
-- Raspberry Pi with fresh OS installation
-- SSH access to the Pi
-- Basic knowledge of terminal commands
+Instructions for deploying to a Raspberry Pi, using nginx as a reverse proxy and systemd for service management.
 
 ## Step 1: Install Required System Packages
 
