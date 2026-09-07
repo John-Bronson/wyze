@@ -57,14 +57,20 @@ Desktop install running this app used **272MB with 196MB swapped to the SD
 card** — the app's own pages were being paged out, which is slow and wears the
 card.
 
-The changes below took it to **197MB used with zero swap**. Each is
-independently reversible.
+The changes below removed the desktop, audio and printing stacks entirely and
+stopped the app being paged out. Each is independently reversible.
 
 | | Before | After |
 |---|---|---|
-| Used | 272MB | **197MB** |
-| Available | 144MB | **218MB** |
+| Used | 272MB | 245MB |
+| Available | 144MB | **170MB** |
 | Swap in use | 196MB | **0B** |
+| App pages on disk | 29MB | **0MB** |
+
+`used` fell further than this at one point - to about 100MB - but that was the
+kernel paging the app out to the SD card, not memory being freed. The figures
+above are the settled state with all three processes fully resident. Judge this
+by the last two rows, not the first.
 
 ## Why the app is the biggest consumer
 
@@ -165,6 +171,49 @@ sudo cp /etc/systemd/system/wyze-flask.service.bak \
 sudo systemctl daemon-reload && sudo systemctl restart wyze-flask
 ```
 
+## 5. Keep the app out of swap
+
+With the default `vm.swappiness=60`, the kernel was writing ~77MB of the app to
+the SD card while growing 221MB of page cache. `used` looked wonderful and the
+app was mostly not in RAM - the first button press after an idle spell had to
+fault it back off the card.
+
+Swappiness is not a threshold. When reclaiming, the kernel chooses between
+anonymous pages (the app's memory, which must be *written* to swap) and
+file-backed pages (page cache, which can usually just be dropped and re-read).
+Swappiness biases that choice. 60 is fairly willing to swap the app out; 10
+prefers dropping cache and swaps only when that is not enough. Values above 100
+(allowed up to 200 since kernel 5.8) favour swap more, which suits zram, where
+swap is compressed RAM. With swap on an SD card, bias the other way.
+
+```bash
+echo 'vm.swappiness=10' | sudo tee /etc/sysctl.d/99-swappiness.conf
+sudo sysctl -w vm.swappiness=10
+```
+
+To pull already-swapped pages back into RAM immediately - swappiness alone will
+not do it:
+
+```bash
+sudo swapoff -a && sudo swapon -a
+```
+
+Check that swap is actually back afterwards; `swapoff` without the matching
+`swapon` leaves the system with no swap at all, in which case memory pressure
+produces the OOM killer instead of a slowdown. `dphys-swapfile.service`
+restores it at the next boot.
+
+Reverse:
+
+```bash
+sudo rm /etc/sysctl.d/99-swappiness.conf
+sudo sysctl -w vm.swappiness=60
+```
+
+**Expect `used` to go up after this, not down.** The app returns to RAM and the
+page cache shrinks. A low `used` figure with the app on disk is worse than a
+higher one with it resident - see the note on measuring below.
+
 ## Considered but not done
 
 **Merging the two processes.** `button.py` and the gunicorn worker each pay the
@@ -196,5 +245,17 @@ free -h                    # swap in use is the signal that matters
 systemd-cgtop -m           # memory by service
 ```
 
+Per-process swap, which is what `free` hides:
+
+```bash
+for p in $(pgrep -f 'gunicorn|button.py'); do
+  sudo awk '/^Rss:/{r+=$2} /^Swap:/{s+=$2} END{printf "  rss=%dMB swap=%dMB\n", r/1024, s/1024}' \
+    /proc/$p/smaps_rollup
+done
+```
+
 **Watch the swap column, not the used column.** Linux is expected to use most
-of RAM; buff/cache is reclaimable. Sustained swap on a Pi means real pressure.
+of RAM, and buff/cache is reclaimable, so a low `used` figure proves nothing on
+its own - it can mean the app has been paged out to the SD card, which is worse
+than a higher figure with everything resident. Sustained swap growth is the
+signal that matters.
