@@ -10,6 +10,7 @@ import json
 # Load environment variables before anything reads them.
 load_dotenv()
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from logging_setup import setup_logging
@@ -25,6 +26,12 @@ wyze_keepalive.enable()
 # to stay polite to Wyze's API.
 MAX_PARALLEL = 6
 _pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL, thread_name_prefix="wyze")
+
+# Quiet period after a group toggle finishes before another press is accepted.
+# Timed from completion rather than from the press, so it covers the Wyze
+# devices themselves taking a moment to actually react - pressing again during
+# that window would read stale states and undo the change just made.
+COOLDOWN_SECONDS = 1.0
 
 
 def _in_pool(fn, *args):
@@ -69,9 +76,12 @@ except Exception as e:
 class FlaskIntegratedButtonController:
     def __init__(self):
         self.client = None
-        self.last_press_time = 0
-        self.debounce_delay = 1.0  # Prevent accidental double-presses
-        self.busy = False          # a group toggle takes seconds; ignore re-entry
+        # gpiozero's bounce_time handles electrical switch bounce. These guard
+        # the slower, application-level case: a group toggle takes seconds, and
+        # presses arriving during or just after it must be dropped.
+        self.busy = False
+        self.ready_at = 0.0   # monotonic time when presses are accepted again
+        self._guard = threading.Lock()  # makes the check-and-set atomic
         self.initialize()
 
     def initialize(self):
@@ -162,17 +172,26 @@ class FlaskIntegratedButtonController:
         return action
 
     def toggle_device(self):
-        """Toggle every device in the group to a single, shared state."""
-        current_time = time.time()
-        if current_time - self.last_press_time < self.debounce_delay:
-            logger.debug("button press ignored (debounce)")
-            return
-        if self.busy:
-            logger.info("button press ignored: previous group toggle still running")
-            return
+        """Toggle every device in the group to a single, shared state.
 
-        self.last_press_time = current_time
-        self.busy = True
+        Presses that arrive while a toggle is running, or within
+        COOLDOWN_SECONDS of one finishing, are dropped.
+        """
+        # Claim the right to run under a lock: gpiozero dispatches callbacks
+        # from its own thread, so an unguarded check-then-set could let two
+        # presses both decide they are first.
+        with self._guard:
+            now = time.monotonic()
+            if self.busy:
+                logger.info("press ignored: a group toggle is already running")
+                return
+            remaining = self.ready_at - now
+            if remaining > 0:
+                logger.info("press ignored: %.1fs left of the %.1fs cooldown",
+                            remaining, COOLDOWN_SECONDS)
+                return
+            self.busy = True
+
         started = time.monotonic()
         try:
             logger.info("button pressed")
@@ -230,7 +249,12 @@ class FlaskIntegratedButtonController:
         except Exception as e:
             logger.exception("unexpected error during group toggle: %s", e)
         finally:
-            self.busy = False
+            with self._guard:
+                self.busy = False
+                # Start the cooldown now, at completion, so the window covers
+                # the devices settling rather than being consumed by the work.
+                self.ready_at = time.monotonic() + COOLDOWN_SECONDS
+            logger.debug("cooldown until %.1fs from now", COOLDOWN_SECONDS)
 
     def show_status(self):
         """Log the current button group at startup."""
