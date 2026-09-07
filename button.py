@@ -42,6 +42,7 @@ class FlaskIntegratedButtonController:
         self.client = None
         self.last_press_time = 0
         self.debounce_delay = 1.0  # Prevent accidental double-presses
+        self.busy = False          # a group toggle takes seconds; ignore re-entry
         self.initialize()
 
     def initialize(self):
@@ -55,145 +56,161 @@ class FlaskIntegratedButtonController:
                          type(e).__name__, e)
             sys.exit(1)
 
-    def get_target_device(self):
-        """Get the currently configured button device from the config (fresh each time)"""
-        # Read JSON file directly to ensure fresh data
-        try:
-            with open('button_config.json', 'r') as file:
-                config_data = json.load(file)
-            button_device_config = config_data.get('button_device')
-        except FileNotFoundError:
-            logger.warning("button_config.json not found")
-            return None
-        except json.JSONDecodeError:
-            logger.warning("invalid JSON in button_config.json")
-            return None
+    def get_target_devices(self):
+        """Resolve the configured button group to live, online devices.
 
-        if not button_device_config:
-            logger.warning("no device configured for button control; "
-                           "set one in the web interface")
-            return None
+        Re-read from disk each press so changes made in the web interface take
+        effect without restarting this daemon.
+        """
+        button_config.reload()
+        configured = button_config.get_button_devices()
+        if not configured:
+            logger.warning("no devices configured for button control; "
+                           "set a group in the web interface")
+            return []
 
         try:
             # Re-fetch the client each press so an expired token is refreshed
             # rather than reused from startup.
             self.client = token_manager.get_client()
             devices = self.client.devices_list()
-            device = next((d for d in devices if d.mac == button_device_config['mac']), None)
-
-            if not device:
-                logger.error("configured device %s (%s) not found in account",
-                             button_device_config['nickname'], button_device_config['mac'])
-                return None
-
-            if not device.is_online:
-                logger.warning("device %s is offline", device.nickname)
-                return None
-
-            return device
-
         except WYZE_ERRORS as e:
             logger.error("error getting device list: %s: %s", type(e).__name__, e)
-            return None
+            return []
+
+        by_mac = {d.mac: d for d in devices}
+        targets = []
+        for entry in configured:
+            device = by_mac.get(entry["mac"])
+            if device is None:
+                logger.error("configured device %s (%s) not found in account",
+                             entry.get("nickname"), entry["mac"])
+            elif not device.is_online:
+                logger.warning("skipping %s: device is offline", device.nickname)
+            else:
+                targets.append(device)
+
+        logger.info("button group: %d of %d configured device(s) usable",
+                    len(targets), len(configured))
+        return targets
 
     def get_device_state(self, device):
-        """Get the current state of the device"""
+        """Current on/off state of one device, or None if it cannot be read."""
         try:
-            logger.debug("checking current state of %s", device.nickname)
-
-            # Different device types have different state properties
             if device.type == 'Plug':
-                # For plugs, get detailed info including state
-                plug_info = self.client.plugs.info(device_mac=device.mac)
-                is_on = plug_info.is_on
-            elif device.type in ['MeshLight', 'Bulb', 'Light']:
-                # For bulbs, get detailed info including state
-                bulb_info = self.client.bulbs.info(device_mac=device.mac)
-                is_on = bulb_info.is_on
-            else:
-                logger.warning("unknown device type %s, assuming OFF", device.type)
-                return False
-
-            logger.info("%s is currently %s", device.nickname, "ON" if is_on else "OFF")
-            return is_on
-
+                return self.client.plugs.info(device_mac=device.mac).is_on
+            if device.type in ['MeshLight', 'Bulb', 'Light']:
+                return self.client.bulbs.info(device_mac=device.mac).is_on
+            logger.warning("unknown device type %s for %s; excluding it from "
+                           "the vote", device.type, device.nickname)
+            return None
         except WYZE_ERRORS as e:
-            logger.error("error getting device state (%s: %s); assuming OFF",
-                         type(e).__name__, e)
-            return False
+            logger.error("could not read state of %s (%s: %s); excluding it "
+                         "from the vote", device.nickname, type(e).__name__, e)
+            return None
+
+    def _controller_for(self, device):
+        return {
+            'Plug': self.client.plugs,
+            'MeshLight': self.client.bulbs,
+            'Bulb': self.client.bulbs,
+            'Light': self.client.bulbs,
+        }.get(device.type)
+
+    def decide_action(self, states):
+        """Majority vote: move the group to whichever state most are NOT in.
+
+        `states` is a list of booleans, one per device we could read. A tie
+        turns everything on - pressing a light switch and getting light is the
+        friendlier outcome.
+        """
+        on_count = sum(1 for state in states if state)
+        off_count = len(states) - on_count
+        action = "off" if on_count > off_count else "on"
+        logger.info("group vote: %d on, %d off -> turning all %s%s",
+                    on_count, off_count, action.upper(),
+                    " (tie)" if on_count == off_count else "")
+        return action
 
     def toggle_device(self):
-        """Toggle the configured button device based on its current state"""
+        """Toggle every device in the group to a single, shared state."""
         current_time = time.time()
         if current_time - self.last_press_time < self.debounce_delay:
             logger.debug("button press ignored (debounce)")
             return
+        if self.busy:
+            logger.info("button press ignored: previous group toggle still running")
+            return
 
         self.last_press_time = current_time
-        logger.info("button pressed")
-
-        # Get current target device from configuration (fresh each time)
-        device = self.get_target_device()
-        if not device:
-            return
-
+        self.busy = True
+        started = time.monotonic()
         try:
-            # Get the actual current state of the device
-            current_state = self.get_device_state(device)
-
-            # Toggle to opposite state
-            action = "off" if current_state else "on"
-            logger.info("turning %s %s", action.upper(), device.nickname)
-
-            # Determine controller type
-            device_controllers = {
-                'Plug': self.client.plugs,
-                'MeshLight': self.client.bulbs,
-                'Bulb': self.client.bulbs,
-                'Light': self.client.bulbs
-            }
-
-            controller = device_controllers.get(device.type)
-            if not controller:
-                logger.error("unsupported device type: %s", device.type)
+            logger.info("button pressed")
+            devices = self.get_target_devices()
+            if not devices:
                 return
 
-            # Execute command
-            if action == "on":
-                controller.turn_on(
-                    device_mac=device.mac,
-                    device_model=device.product.model
-                )
-            else:
-                controller.turn_off(
-                    device_mac=device.mac,
-                    device_model=device.product.model
-                )
+            states = []
+            readable = []
+            for device in devices:
+                state = self.get_device_state(device)
+                if state is None:
+                    continue
+                logger.info("  %s is %s", device.nickname, "ON" if state else "OFF")
+                states.append(state)
+                readable.append(device)
 
-            logger.info("%s is now %s", device.nickname, action.upper())
+            if not states:
+                logger.error("could not read the state of any device in the "
+                             "group; doing nothing")
+                return
 
-        except WYZE_ERRORS as e:
-            logger.error("error controlling device: %s: %s", type(e).__name__, e)
+            action = self.decide_action(states)
+
+            succeeded = 0
+            for device in readable:
+                controller = self._controller_for(device)
+                if not controller:
+                    logger.error("unsupported device type %s for %s",
+                                 device.type, device.nickname)
+                    continue
+                try:
+                    if action == "on":
+                        controller.turn_on(device_mac=device.mac,
+                                           device_model=device.product.model)
+                    else:
+                        controller.turn_off(device_mac=device.mac,
+                                            device_model=device.product.model)
+                    logger.info("  %s is now %s", device.nickname, action.upper())
+                    succeeded += 1
+                except WYZE_ERRORS as e:
+                    logger.error("  failed to turn %s %s: %s: %s", action,
+                                 device.nickname, type(e).__name__, e)
+
+            logger.info("group toggle complete: %d/%d device(s) turned %s in %.1fs",
+                        succeeded, len(readable), action.upper(),
+                        time.monotonic() - started)
         except Exception as e:
-            logger.exception("unexpected error controlling device: %s", e)
+            logger.exception("unexpected error during group toggle: %s", e)
+        finally:
+            self.busy = False
 
     def show_status(self):
-        """Show current button configuration status"""
-        button_device_config = button_config.get_button_device()
-        if not button_device_config:
-            logger.warning("no device configured for button control; "
-                           "configure one in the web interface")
+        """Log the current button group at startup."""
+        configured = button_config.get_button_devices()
+        if not configured:
+            logger.warning("no devices configured for button control; "
+                           "configure a group in the web interface")
             return
 
-        logger.info("button configured for %s (%s)",
-                    button_device_config['nickname'], button_device_config['mac'])
-        device = self.get_target_device()
-        if device:
+        logger.info("button group has %d device(s): %s", len(configured),
+                    ", ".join(d.get("nickname", d["mac"]) for d in configured))
+        devices = self.get_target_devices()
+        for device in devices:
             state = self.get_device_state(device)
-            logger.info("device is online and ready, currently %s",
-                        "ON" if state else "OFF")
-        else:
-            logger.warning("configured device is not available")
+            logger.info("  %s: %s", device.nickname,
+                        "unknown" if state is None else ("ON" if state else "OFF"))
 
 
 try:
@@ -212,7 +229,7 @@ except Exception as e:
 try:
     button.when_pressed = controller.toggle_device
     logger.info("button handler attached; press the button to toggle the "
-                "configured device")
+                "configured group")
 except Exception as e:
     logger.exception("button handler error: %s", e)
     sys.exit(1)

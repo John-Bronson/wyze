@@ -82,37 +82,31 @@ def toggle_device(mac, action):
         return f"Error controlling device: {str(e)}", 502
 
 
-@app.route("/set_button_device/<mac>")
-def set_button_device(mac):
-    """Set which device the GPIO button should control"""
+@app.route("/set_button_group", methods=["POST"])
+def set_button_group():
+    """Replace the button group with whatever was ticked in edit mode."""
+    macs = request.form.getlist("macs")
     try:
         client = token_manager.get_client()
-        device = next((device for device in client.devices_list() if device.mac == mac), None)
-
-        if device:
-            success = button_config.set_button_device(device.mac, device.nickname)
-            if success:
-                flash(f"✅ Button configured to control: {device.nickname}", "success")
-            else:
-                flash("❌ Failed to save button configuration", "error")
-        else:
-            flash("❌ Device not found", "error")
-
+        by_mac = {d.mac: d for d in client.devices_list()}
     except WYZE_ERRORS as e:
-        logger.exception("failed to set button device %s: %s", mac, e)
-        flash(f"❌ Error: {str(e)}", "error")
+        logger.exception("could not load devices while saving button group: %s", e)
+        flash(f"❌ Error saving group: {e}", "error")
+        return redirect(url_for('index'))
 
-    return redirect(url_for('index'))
+    # Store the live nickname so the group list stays readable, and ignore any
+    # mac that is not actually in the account.
+    selected = [{"mac": mac, "nickname": by_mac[mac].nickname}
+                for mac in macs if mac in by_mac]
 
-
-@app.route("/clear_button_device")
-def clear_button_device():
-    """Clear the button device configuration"""
-    success = button_config.clear_button_device()
-    if success:
-        flash(" Button configuration cleared", "info")
+    if button_config.set_button_devices(selected):
+        if selected:
+            flash("✅ Button group saved: " +
+                  ", ".join(d["nickname"] for d in selected), "success")
+        else:
+            flash("Button group is now empty", "info")
     else:
-        flash("❌ Failed to clear button configuration", "error")
+        flash("❌ Failed to save button group", "error")
 
     return redirect(url_for('index'))
 
@@ -156,25 +150,31 @@ def index():
         return f"<p>Error: {e}</p><p><a href='/logs'>View logs</a></p>", 502
 
     # Get current button configuration
-    current_button_device = button_config.get_button_device()
+    edit_mode = request.args.get("edit") == "1"
+    group = button_config.get_button_devices()
 
-    # The stored nickname is a snapshot taken when the button was configured.
-    # Renaming the device in the Wyze app leaves it stale, so the config box and
-    # the device list show different names for the same bulb and it looks like
-    # the button device is missing. Matching is by MAC, so only the label drifts
-    # - resync it here.
-    if current_button_device:
-        live = next((d for d in devices
-                     if d.mac == current_button_device['mac']), None)
-        if live is None:
-            logger.warning("button device %s (%s) is not in this account",
-                           current_button_device['nickname'],
-                           current_button_device['mac'])
-        elif live.nickname != current_button_device['nickname']:
-            logger.info("button device renamed %r -> %r; updating button_config.json",
-                        current_button_device['nickname'], live.nickname)
-            button_config.set_button_device(live.mac, live.nickname)
-            current_button_device = button_config.get_button_device()
+    # Stored nicknames are snapshots taken when the group was saved. Renaming a
+    # device in the Wyze app leaves them stale, so the group box and the device
+    # list disagree and it looks like a member is missing. Matching is by MAC,
+    # so only the label drifts - resync it here.
+    if group:
+        by_mac = {d.mac: d for d in devices}
+        renamed = False
+        for entry in group:
+            live = by_mac.get(entry["mac"])
+            if live is None:
+                logger.warning("button group member %s (%s) is not in this account",
+                               entry.get("nickname"), entry["mac"])
+            elif live.nickname != entry.get("nickname"):
+                logger.info("button group member renamed %r -> %r; updating "
+                            "button_config.json", entry.get("nickname"), live.nickname)
+                entry["nickname"] = live.nickname
+                renamed = True
+        if renamed:
+            button_config.set_button_devices(group)
+            group = button_config.get_button_devices()
+
+    group_macs = {d["mac"] for d in group}
 
     # Create HTML output with enhanced styling
     html = """
@@ -253,6 +253,16 @@ def index():
             .flash.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
             .flash.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
             .flash.info { background: #d1ecf1; color: #0c5460; border: 1px solid #b8daff; }
+            .group-list { list-style: none; padding: 0; margin: 10px 0; }
+            .group-list li { display: inline-block; background: #2196F3; color: white;
+                             padding: 4px 10px; border-radius: 12px; margin: 3px;
+                             font-size: 13px; font-weight: bold; }
+            .device.selected { border-color: #2196F3; background: #f8f9ff; }
+            .pick { display: flex; align-items: center; gap: 10px; }
+            .pick input { width: 22px; height: 22px; }
+            .editbar { position: sticky; bottom: 0; background: #fff; padding: 12px;
+                       border-top: 2px solid #2196F3; text-align: center; margin-top: 10px; }
+            .hint { color: #666; font-size: 13px; }
         </style>
     </head>
     <body>
@@ -268,40 +278,69 @@ def index():
             </div>
     """
 
-    # Show current button configuration
-    if current_button_device:
-        html += f"""
-            <div class="button-status">
-                <h3> GPIO Button Configuration</h3>
-                <p><strong>Currently controlling:</strong> {current_button_device['nickname']}</p>
-                <p><strong>MAC Address:</strong> {current_button_device['mac']}</p>
-                <a href="/clear_button_device" class="btn btn-secondary">Clear Button Config</a>
-            </div>
-        """
-    else:
+    # Show the button group, or the edit form header
+    if edit_mode:
         html += """
             <div class="button-status">
-                <h3> GPIO Button Configuration</h3>
-                <p><em>No device configured for GPIO button control</em></p>
-                <p>Click "Set as Button Device" on any device below to configure it.</p>
+                <h3>Edit Button Group</h3>
+                <p class="hint">Tick every device the GPIO button should control,
+                   then save. Pressing the button moves them all to the same state.</p>
             </div>
         """
+        # The device list below lives inside this form so one Save submits it all.
+        html += '<form method="POST" action="/set_button_group">'
+    else:
+        if group:
+            members = "".join(f"<li>{d['nickname']}</li>" for d in group)
+            html += f"""
+            <div class="button-status">
+                <h3>GPIO Button Group</h3>
+                <ul class="group-list">{members}</ul>
+                <p class="hint">Pressing the button reads all {len(group)} device(s)
+                   and moves them to whichever state most are not in.</p>
+                <a href="/?edit=1" class="btn btn-button">Edit button group</a>
+            </div>
+            """
+        else:
+            html += """
+            <div class="button-status">
+                <h3>GPIO Button Group</h3>
+                <p><em>No devices configured for GPIO button control</em></p>
+                <a href="/?edit=1" class="btn btn-button">Edit button group</a>
+            </div>
+            """
 
     html += "<h2> Available Devices</h2>"
 
     for device in devices:
-        is_button_device = (current_button_device and
-                            current_button_device['mac'] == device.mac)
-
-        device_class = "device button-controlled" if is_button_device else "device"
+        in_group = device.mac in group_macs
+        device_class = "device selected" if in_group else "device"
 
         html += f'<div class="{device_class}">'
+
+        if edit_mode:
+            # A checkbox per device; the surrounding form posts them together.
+            checked = " checked" if in_group else ""
+            offline_note = "" if device.is_online else \
+                ' <span class="device-status offline">Offline</span>'
+            html += f"""
+                <label class="pick">
+                    <input type="checkbox" name="macs" value="{device.mac}"{checked}>
+                    <span>
+                        <span class="device-name">{device.nickname}</span>{offline_note}
+                        <br><span class="hint">{device.type} &middot; {device.mac}</span>
+                    </span>
+                </label>
+            """
+            html += '</div>'
+            continue
+
         html += '<div class="device-header">'
         html += f'<div class="device-name">{device.nickname}</div>'
         html += '<div>'
 
-        if is_button_device:
-            html += '<span class="button-controlled-badge"> Button Device</span> '
+        if in_group:
+            html += '<span class="button-controlled-badge">In Button Group</span> '
 
         status_class = "online" if device.is_online else "offline"
         status_text = "Online" if device.is_online else "Offline"
@@ -318,14 +357,19 @@ def index():
                 <a href="/toggle/{device.mac}/on" class="btn btn-on">Turn On</a>
                 <a href="/toggle/{device.mac}/off" class="btn btn-off">Turn Off</a>
             """
-            if not is_button_device:
-                html += f"""
-                    <a href="/set_button_device/{device.mac}" class="btn btn-button"> Set as Button Device</a>
-                """
         else:
             html += "<p><em>Device is offline - cannot control</em></p>"
 
         html += '</div></div>'
+
+    if edit_mode:
+        html += """
+            <div class="editbar">
+                <button type="submit" class="btn btn-on">Save group</button>
+                <a href="/" class="btn btn-secondary">Cancel</a>
+            </div>
+            </form>
+        """
 
     html += """
         </div>
