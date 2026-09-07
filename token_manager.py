@@ -41,8 +41,8 @@ class TokenManager:
         print("Refreshing the access token...")
         try:
             temp_client = Client(token=self.access_token)
-            # Corrected this call to pass the refresh token
-            refresh_response = temp_client.refresh_token(self.refresh_token)
+            # Client.refresh_token() takes no args; it uses the token set on the client
+            refresh_response = temp_client.refresh_token()
             self._update_tokens_and_client(refresh_response)
         except WyzeApiError as e:
             print(f"Token refresh failed: {e}")
