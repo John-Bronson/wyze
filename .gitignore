@@ -1,4 +1,6 @@
 .env
+.tokens.json
+logs/
 .idea/*
 .venv/
 __pycache__/

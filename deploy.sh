@@ -34,6 +34,7 @@ rsync -az --itemize-changes \
   --exclude '.git/' --exclude '.idea/' --exclude '.venv/' \
   --exclude '__pycache__/' --exclude '*.pyc' \
   --exclude '.env' --exclude 'button_config.json' \
+  --exclude '.tokens.json' --exclude 'logs/' \
   --exclude 'chat-*.txt' \
   ./ "$HOST:$REMOTE_DIR/"
 

@@ -1,17 +1,40 @@
 from flask import Flask, redirect, url_for, request, flash
 import os
-from wyze_sdk.errors import WyzeApiError
+import time
+from wyze_sdk.errors import WyzeApiError, WyzeClientError
 from dotenv import load_dotenv
 
+# Load environment variables before anything reads them.
+load_dotenv()
+
+from logging_setup import setup_logging, log_files, read_log
 # Import the single instance of our token manager from the refactored file
 from token_manager import token_manager
 from button_config import button_config
 
+logger = setup_logging("web")
+
 app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', 'your-secret-key-here')  # Add to your .env file
 
-# Load environment variables from .env file
-load_dotenv()
+# WyzeClientError covers configuration failures such as a client that cannot
+# refresh. It is NOT a subclass of WyzeApiError, so it has to be named
+# explicitly or it escapes as a 500 - which is exactly how this app used to
+# fail silently an hour after every restart.
+WYZE_ERRORS = (WyzeApiError, WyzeClientError)
+
+
+@app.before_request
+def _log_request():
+    request._started = time.monotonic()
+
+
+@app.after_request
+def _log_response(response):
+    elapsed = (time.monotonic() - getattr(request, "_started", time.monotonic())) * 1000
+    logger.info("%s %s -> %s (%.0fms)", request.method, request.path,
+                response.status_code, elapsed)
+    return response
 
 
 # Validate required environment variables at startup
@@ -32,8 +55,11 @@ def toggle_device(mac, action):
         client = token_manager.get_client()
         device = next((device for device in client.devices_list() if device.mac == mac), None)
 
-        print(f"Toggling device: {device.nickname} ({device.mac}) of type {device.type} with action: {action}")
-        print(device)
+        if not device:
+            logger.warning("toggle requested for unknown mac %s", mac)
+            return f"Device {mac} not found", 404
+        logger.info("toggling %s (%s, type=%s) -> %s",
+                    device.nickname, device.mac, device.type, action)
 
         device_controllers = {
             'Plug': client.plugs,
@@ -51,8 +77,9 @@ def toggle_device(mac, action):
                 controller.turn_off(device_mac=device.mac, device_model=device.product.model)
 
         return redirect(url_for('index'))
-    except WyzeApiError as e:
-        return f"Error controlling device: {str(e)}"
+    except WYZE_ERRORS as e:
+        logger.exception("failed to toggle %s: %s", mac, e)
+        return f"Error controlling device: {str(e)}", 502
 
 
 @app.route("/set_button_device/<mac>")
@@ -71,7 +98,8 @@ def set_button_device(mac):
         else:
             flash("❌ Device not found", "error")
 
-    except WyzeApiError as e:
+    except WYZE_ERRORS as e:
+        logger.exception("failed to set button device %s: %s", mac, e)
         flash(f"❌ Error: {str(e)}", "error")
 
     return redirect(url_for('index'))
@@ -110,8 +138,9 @@ def carriage():
             </p>
         """
         return html
-    except WyzeApiError as e:
-        return f"Error controlling device: {str(e)}"
+    except WYZE_ERRORS as e:
+        logger.exception("carriage page failed: %s", e)
+        return f"Error controlling device: {str(e)}", 502
 
 
 @app.route("/")
@@ -122,11 +151,30 @@ def index():
         # Get the single, managed client instance
         client = token_manager.get_client()
         devices = client.devices_list()
-    except (WyzeApiError, EnvironmentError) as e:
-        return f"<p>Error: {e}</p>"
+    except (WyzeApiError, WyzeClientError, EnvironmentError) as e:
+        logger.exception("index failed: %s", e)
+        return f"<p>Error: {e}</p><p><a href='/logs'>View logs</a></p>", 502
 
     # Get current button configuration
     current_button_device = button_config.get_button_device()
+
+    # The stored nickname is a snapshot taken when the button was configured.
+    # Renaming the device in the Wyze app leaves it stale, so the config box and
+    # the device list show different names for the same bulb and it looks like
+    # the button device is missing. Matching is by MAC, so only the label drifts
+    # - resync it here.
+    if current_button_device:
+        live = next((d for d in devices
+                     if d.mac == current_button_device['mac']), None)
+        if live is None:
+            logger.warning("button device %s (%s) is not in this account",
+                           current_button_device['nickname'],
+                           current_button_device['mac'])
+        elif live.nickname != current_button_device['nickname']:
+            logger.info("button device renamed %r -> %r; updating button_config.json",
+                        current_button_device['nickname'], live.nickname)
+            button_config.set_button_device(live.mac, live.nickname)
+            current_button_device = button_config.get_button_device()
 
     # Create HTML output with enhanced styling
     html = """
@@ -210,6 +258,7 @@ def index():
     <body>
         <div class="container">
             <h1> Wyze Device Controller</h1>
+            <p><a href="/logs">View logs &amp; token status</a></p>
     """
 
     # Add flash messages
@@ -285,6 +334,68 @@ def index():
     """
 
     return html
+
+
+@app.route("/logs")
+@app.route("/logs/<name>")
+def logs(name=None):
+    """Read the application logs from the browser.
+
+    Deliberately unauthenticated for now, matching the rest of the app; the
+    logging filter redacts credentials so nothing sensitive is served here.
+    """
+    available = log_files()
+    if not available:
+        return "<p>No logs yet. They appear under logs/ once the app runs.</p>"
+    if name is None or name not in available:
+        name = available[0]
+
+    try:
+        lines = min(int(request.args.get("lines", 200)), 5000)
+    except ValueError:
+        lines = 200
+
+    status = token_manager.status()
+    body = read_log(name, lines)
+
+    tabs = " ".join(
+        f'<a class="tab{" active" if f == name else ""}" href="/logs/{f}?lines={lines}">{f}</a>'
+        for f in available
+    )
+    rows = "".join(
+        f"<tr><th>{k.replace('_', ' ')}</th><td>{'-' if v is None else v}</td></tr>"
+        for k, v in status.items()
+    )
+
+    return f"""<!DOCTYPE html>
+<html><head><title>Logs - Wyze Controller</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
+  .container {{ max-width: 1100px; margin: 0 auto; }}
+  .tab {{ display: inline-block; padding: 8px 14px; background: #fff; border: 1px solid #ddd;
+         border-radius: 4px; text-decoration: none; color: #333; margin-right: 6px; }}
+  .tab.active {{ background: #2196F3; color: #fff; border-color: #2196F3; }}
+  table {{ border-collapse: collapse; margin: 16px 0; background: #fff; }}
+  th, td {{ text-align: left; padding: 6px 12px; border: 1px solid #ddd; font-size: 14px; }}
+  th {{ background: #f0f0f0; font-weight: bold; }}
+  pre {{ background: #1e1e1e; color: #e6e6e6; padding: 14px; border-radius: 6px;
+        overflow-x: auto; font-size: 12px; line-height: 1.45; max-height: 65vh; }}
+  .muted {{ color: #666; font-size: 13px; }}
+</style></head><body><div class="container">
+<h1>Logs</h1>
+<p><a href="/">&larr; Back to devices</a></p>
+<h3>Token status</h3>
+<table>{rows}</table>
+<h3>Log files</h3>
+<p>{tabs}</p>
+<p class="muted">Showing the last {lines} lines of <strong>{name}</strong>.
+   <a href="/logs/{name}?lines=1000">Show 1000</a> &middot;
+   <a href="/logs/{name}?lines={lines}">Refresh</a></p>
+<pre>{body.replace("&", "&amp;").replace("<", "&lt;")}</pre>
+<p class="muted">On the Pi: <code>tail -f ~/wyze/logs/{name}</code>
+   or <code>journalctl -u wyze-flask -f</code></p>
+</div></body></html>"""
 
 
 if __name__ == "__main__":
