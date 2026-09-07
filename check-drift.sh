@@ -21,8 +21,10 @@ mapfile -t files < <(git ls-files | grep -vE '^(\.env|button_config\.json)$')
 
 drift=0
 for f in "${files[@]}"; do
+  # Absent on the Pi is not drift - there is nothing there to overwrite.
+  # It just means the file is new since the last deploy.
   if ! scp -q "$HOST:$REMOTE_DIR/$f" "$tmp/remote" 2>/dev/null; then
-    printf '  MISSING ON PI  %s\n' "$f"; drift=1; continue
+    printf '  new            %s   (will be created)\n' "$f"; continue
   fi
   if ! diff -q "$f" "$tmp/remote" >/dev/null 2>&1; then
     lt=$(date -r "$f" +%s)
@@ -45,7 +47,7 @@ if [ "$drift" -eq 0 ]; then
   echo "No Pi-side drift; safe to deploy."
 else
   echo
-  echo "Pi-side changes would be OVERWRITTEN by a deploy."
+  echo "The Pi holds a NEWER copy of the file(s) above; a deploy would destroy it."
   echo "Inspect one with:  ssh $HOST 'cat $REMOTE_DIR/<file>' | diff <file> -"
 fi
 exit "$drift"
