@@ -10,10 +10,39 @@ import json
 # Load environment variables before anything reads them.
 load_dotenv()
 
+from concurrent.futures import ThreadPoolExecutor
+
 from logging_setup import setup_logging
+import wyze_keepalive
 
 logger = setup_logging("button")
 logger.info("starting button.py")
+wyze_keepalive.enable()
+
+# One long-lived pool, deliberately not per-press: wyze_keepalive keeps a warm
+# HTTPS connection per thread, and reusing the same threads keeps those
+# connections alive between button presses. Capped well below the device count
+# to stay polite to Wyze's API.
+MAX_PARALLEL = 6
+_pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL, thread_name_prefix="wyze")
+
+
+def _in_pool(fn, *args):
+    """Run one call on a pool thread, so it uses a warm connection."""
+    return _pool.submit(fn, *args).result()
+
+
+def _map_pool(fn, items):
+    """Run fn over items concurrently, preserving order. Exceptions come back
+    as the result so one failure cannot abandon the rest of the group."""
+    futures = [_pool.submit(fn, item) for item in items]
+    results = []
+    for future in futures:
+        try:
+            results.append(future.result())
+        except Exception as err:  # logged by the caller alongside its device
+            results.append(err)
+    return results
 
 # WyzeClientError is not a subclass of WyzeApiError. Catching only the latter
 # is what let a failed token refresh kill this process outright, leaving
@@ -73,7 +102,7 @@ class FlaskIntegratedButtonController:
             # Re-fetch the client each press so an expired token is refreshed
             # rather than reused from startup.
             self.client = token_manager.get_client()
-            devices = self.client.devices_list()
+            devices = _in_pool(self.client.devices_list)
         except WYZE_ERRORS as e:
             logger.error("error getting device list: %s: %s", type(e).__name__, e)
             return []
@@ -151,15 +180,22 @@ class FlaskIntegratedButtonController:
             if not devices:
                 return
 
+            read_started = time.monotonic()
+            outcomes = _map_pool(self.get_device_state, devices)
             states = []
             readable = []
-            for device in devices:
-                state = self.get_device_state(device)
+            for device, state in zip(devices, outcomes):
+                if isinstance(state, Exception):
+                    logger.error("  could not read %s: %s: %s", device.nickname,
+                                 type(state).__name__, state)
+                    continue
                 if state is None:
                     continue
                 logger.info("  %s is %s", device.nickname, "ON" if state else "OFF")
                 states.append(state)
                 readable.append(device)
+            logger.info("read %d device state(s) in %.1fs", len(states),
+                        time.monotonic() - read_started)
 
             if not states:
                 logger.error("could not read the state of any device in the "
@@ -168,25 +204,25 @@ class FlaskIntegratedButtonController:
 
             action = self.decide_action(states)
 
-            succeeded = 0
-            for device in readable:
+            def apply(device):
                 controller = self._controller_for(device)
                 if not controller:
-                    logger.error("unsupported device type %s for %s",
-                                 device.type, device.nickname)
-                    continue
-                try:
-                    if action == "on":
-                        controller.turn_on(device_mac=device.mac,
-                                           device_model=device.product.model)
-                    else:
-                        controller.turn_off(device_mac=device.mac,
-                                            device_model=device.product.model)
+                    raise ValueError(f"unsupported device type {device.type}")
+                command = controller.turn_on if action == "on" else controller.turn_off
+                command(device_mac=device.mac, device_model=device.product.model)
+                return True
+
+            write_started = time.monotonic()
+            succeeded = 0
+            for device, outcome in zip(readable, _map_pool(apply, readable)):
+                if isinstance(outcome, Exception):
+                    logger.error("  failed to turn %s %s: %s: %s", action,
+                                 device.nickname, type(outcome).__name__, outcome)
+                else:
                     logger.info("  %s is now %s", device.nickname, action.upper())
                     succeeded += 1
-                except WYZE_ERRORS as e:
-                    logger.error("  failed to turn %s %s: %s: %s", action,
-                                 device.nickname, type(e).__name__, e)
+            logger.info("applied %d change(s) in %.1fs", succeeded,
+                        time.monotonic() - write_started)
 
             logger.info("group toggle complete: %d/%d device(s) turned %s in %.1fs",
                         succeeded, len(readable), action.upper(),

@@ -8,11 +8,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from logging_setup import setup_logging, log_files, read_log
+import wyze_keepalive
 # Import the single instance of our token manager from the refactored file
 from token_manager import token_manager
 from button_config import button_config
 
 logger = setup_logging("web")
+wyze_keepalive.enable()
 
 app = Flask(__name__)
 app.secret_key = os.getenv('FLASK_SECRET_KEY', 'your-secret-key-here')  # Add to your .env file
